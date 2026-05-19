@@ -1,0 +1,242 @@
+"""
+Sub-RQ4 targeted SHAP analysis.
+What distinguishes correctly-classified low-credibility sources from false negatives?
+Replicates the feature engineering from Model_comparison_v3.py.
+"""
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import joblib
+import shap
+
+BASE = r"C:\Users\Wilbe\OneDrive\Desktop\profiling-data-Copy(1)\thesis_output\model_results_v4"
+OUT_DIR = os.path.join(BASE, "subrq4_analysis")
+os.makedirs(OUT_DIR, exist_ok=True)
+
+
+# ======================================================================
+# Replicates engineer_features() from Model_comparison_v3.py (lines 814-961)
+# ======================================================================
+def engineer_features(df):
+    df = df.copy()
+    new_cols = []
+
+    def safe_div(a, b, default=0):
+        return np.where(b > 0, a / b, default)
+
+    # --- 1. RATIO FEATURES ---
+    if "num_scripts" in df.columns and "total_tags" in df.columns:
+        df["ratio_scripts_per_tag"] = safe_div(df["num_scripts"], df["total_tags"]); new_cols.append("ratio_scripts_per_tag")
+    if "num_iframes" in df.columns and "total_tags" in df.columns:
+        df["ratio_iframes_per_tag"] = safe_div(df["num_iframes"], df["total_tags"]); new_cols.append("ratio_iframes_per_tag")
+    if "ad_keyword_count" in df.columns and "num_paragraphs" in df.columns:
+        df["ratio_ads_per_paragraph"] = safe_div(df["ad_keyword_count"], df["num_paragraphs"]); new_cols.append("ratio_ads_per_paragraph")
+    if "num_links_external" in df.columns and "num_links_total" in df.columns:
+        df["ratio_external_links"] = safe_div(df["num_links_external"], df["num_links_total"]); new_cols.append("ratio_external_links")
+    if "num_links_empty" in df.columns and "num_links_total" in df.columns:
+        df["ratio_empty_links"] = safe_div(df["num_links_empty"], df["num_links_total"]); new_cols.append("ratio_empty_links")
+    if "inline_script_count" in df.columns and "num_scripts" in df.columns:
+        df["ratio_inline_scripts"] = safe_div(df["inline_script_count"], df["num_scripts"].clip(lower=1)); new_cols.append("ratio_inline_scripts")
+    if "num_headings" in df.columns and "num_paragraphs" in df.columns:
+        df["ratio_headings_per_paragraph"] = safe_div(df["num_headings"], df["num_paragraphs"]); new_cols.append("ratio_headings_per_paragraph")
+    if "num_images" in df.columns and "word_count" in df.columns:
+        df["ratio_images_per_1k_words"] = safe_div(df["num_images"] * 1000, df["word_count"]); new_cols.append("ratio_images_per_1k_words")
+    if "third_party_script_domains" in df.columns and "num_scripts" in df.columns:
+        df["ratio_third_party_scripts"] = safe_div(df["third_party_script_domains"], df["num_scripts"].clip(lower=1)); new_cols.append("ratio_third_party_scripts")
+    if "popup_indicator_count" in df.columns and "total_tags" in df.columns:
+        df["ratio_popups_per_tag"] = safe_div(df["popup_indicator_count"], df["total_tags"]); new_cols.append("ratio_popups_per_tag")
+
+    # --- 2. INTERACTION FEATURES ---
+    if "ad_keyword_count" in df.columns and "hidden_element_count" in df.columns:
+        df["interact_ads_x_hidden"] = df["ad_keyword_count"] * df["hidden_element_count"]; new_cols.append("interact_ads_x_hidden")
+    if "num_scripts" in df.columns and "third_party_script_domains" in df.columns:
+        df["interact_scripts_x_3rdparty"] = df["num_scripts"] * df["third_party_script_domains"]; new_cols.append("interact_scripts_x_3rdparty")
+    if "text_to_html_ratio" in df.columns and "ad_keyword_count" in df.columns:
+        df["interact_low_text_high_ads"] = (1 - df["text_to_html_ratio"].clip(upper=1)) * df["ad_keyword_count"]; new_cols.append("interact_low_text_high_ads")
+    if "popup_indicator_count" in df.columns and "num_iframes" in df.columns:
+        df["interact_popups_x_iframes"] = df["popup_indicator_count"] * df["num_iframes"]; new_cols.append("interact_popups_x_iframes")
+    if "num_links_external" in df.columns and "num_links_empty" in df.columns:
+        df["interact_external_x_empty_links"] = df["num_links_external"] * df["num_links_empty"]; new_cols.append("interact_external_x_empty_links")
+
+    clickbait_cols = ["clickbait_allcaps_headlines", "clickbait_exclamation_headlines", "clickbait_question_headlines"]
+    if all(c in df.columns for c in clickbait_cols):
+        df["clickbait_total"] = df[clickbait_cols].sum(axis=1); new_cols.append("clickbait_total")
+        if "text_to_html_ratio" in df.columns:
+            df["interact_clickbait_x_low_text"] = df["clickbait_total"] * (1 - df["text_to_html_ratio"].clip(upper=1)); new_cols.append("interact_clickbait_x_low_text")
+
+    # --- 3. AGGREGATED SCORES ---
+    trust_cols = ["has_about_page_link", "has_contact_page_link", "has_privacy_policy_link",
+                  "has_terms_link", "has_meta_description", "has_og_tags", "has_canonical"]
+    available_trust = [c for c in trust_cols if c in df.columns]
+    if available_trust:
+        df["trust_score"] = df[available_trust].sum(axis=1); new_cols.append("trust_score")
+
+    if all(c in df.columns for c in ["ad_keyword_count", "popup_indicator_count", "hidden_element_count", "num_links_empty"]):
+        df["deception_score"] = (
+            df["ad_keyword_count"].clip(upper=20) / 20 * 0.3
+            + df["popup_indicator_count"].clip(upper=20) / 20 * 0.25
+            + df["hidden_element_count"].clip(upper=20) / 20 * 0.25
+            + df["num_links_empty"].clip(upper=50) / 50 * 0.2
+        )
+        new_cols.append("deception_score")
+
+    if "trust_score" in df.columns and "deception_score" in df.columns:
+        df["trust_deception_ratio"] = safe_div(df["trust_score"], df["deception_score"].clip(lower=0.01)); new_cols.append("trust_deception_ratio")
+
+    if all(c in df.columns for c in ["total_tags", "unique_tags", "max_dom_depth"]):
+        df["complexity_score"] = (
+            np.log1p(df["total_tags"]) * 0.4 + df["unique_tags"] * 0.3 + df["max_dom_depth"] * 0.3
+        )
+        new_cols.append("complexity_score")
+
+    # --- 4. LOG-TRANSFORMS ---
+    skewed = ["total_tags", "html_length", "text_length", "word_count",
+              "num_links_total", "num_scripts", "num_divs", "num_spans",
+              "ad_keyword_count", "sentence_count", "css_total_length",
+              "ext_css_size_bytes", "ext_css_num_selectors", "ext_css_num_classes"]
+    for col in skewed:
+        if col in df.columns:
+            df[f"log_{col}"] = np.log1p(df[col].clip(lower=0)); new_cols.append(f"log_{col}")
+
+    # Fill NaN/inf
+    for col in new_cols:
+        df[col] = df[col].fillna(0).replace([np.inf, -np.inf], 0)
+
+    return df
+
+
+# ======================================================================
+# 1. LOAD
+# ======================================================================
+bundle = joblib.load(os.path.join(BASE, "final_xgb_Enriched.joblib"))
+model            = bundle["model"]
+scaler           = bundle["scaler"]
+selector         = bundle["selector"]
+label_encoder    = bundle["label_encoder"]
+feats_engineered = bundle["feature_names_engineered"]   # 225
+feats_selected   = bundle["feature_names_selected"]     # 135
+
+print("Label encoder classes:", list(label_encoder.classes_))
+LOW_IDX  = list(label_encoder.classes_).index("low credibility")
+HIGH_IDX = list(label_encoder.classes_).index("high credibility")
+MED_IDX  = list(label_encoder.classes_).index("medium credibility")
+print(f"LOW_IDX={LOW_IDX}, HIGH_IDX={HIGH_IDX}, MED_IDX={MED_IDX}")
+
+df    = pd.read_pickle(os.path.join(BASE, "enriched_df_cache.pkl"))
+preds = pd.read_csv(os.path.join(BASE, "predictions",
+                                 "preds_Enriched_XGB_SMOTE_weights.csv"))
+
+# ======================================================================
+# 2. RECONSTRUCT feature matrix
+# ======================================================================
+df_engineered = engineer_features(df)
+
+missing = [c for c in feats_engineered if c not in df_engineered.columns]
+if missing:
+    print(f"\nERROR: {len(missing)} features still missing after engineering:")
+    print(missing)
+    raise SystemExit(1)
+
+X_eng    = df_engineered[feats_engineered].fillna(0).values
+X_sel    = selector.transform(X_eng)        # 225 -> 135 FIRST
+X_scaled = scaler.transform(X_sel)          # then scale the 135
+X_sel_df = pd.DataFrame(X_scaled, columns=feats_selected)
+print(f"\nReconstructed X_selected shape: {X_sel_df.shape}")
+
+# ======================================================================
+# 3. SPLIT predictions by TP / FN-high / FN-medium
+# ======================================================================
+preds_sorted = preds.sort_values("test_idx").reset_index(drop=True)
+assert len(preds_sorted) == len(df), "Prediction count != dataframe rows"
+
+y_true = preds_sorted["y_true"].values
+y_pred = preds_sorted["y_pred"].values
+
+is_true_low = (y_true == LOW_IDX)
+low_idx     = np.where(is_true_low)[0]
+print(f"\nTrue low-credibility sources: {is_true_low.sum()}")
+
+pred_low     = y_pred[is_true_low]
+mask_tp      = (pred_low == LOW_IDX)
+mask_fn_high = (pred_low == HIGH_IDX)
+mask_fn_med  = (pred_low == MED_IDX)
+mask_fn_all  = ~mask_tp
+
+print(f"  Correctly classified (TP):    {mask_tp.sum()}")
+print(f"  Missed as high (FN_high):     {mask_fn_high.sum()}")
+print(f"  Missed as medium (FN_medium): {mask_fn_med.sum()}")
+print(f"  All false negatives:          {mask_fn_all.sum()}")
+
+X_low = X_sel_df.iloc[low_idx].reset_index(drop=True)
+
+# ======================================================================
+# 4. SHAP
+# ======================================================================
+print("\nComputing SHAP values on the low-credibility subset...")
+explainer = shap.TreeExplainer(model)
+shap_raw  = explainer.shap_values(X_low)
+
+if isinstance(shap_raw, list):
+    shap_low = shap_raw[LOW_IDX]
+elif shap_raw.ndim == 3:
+    shap_low = shap_raw[:, :, LOW_IDX]
+else:
+    raise RuntimeError(f"Unexpected SHAP shape: {shap_raw.shape}")
+
+shap_df = pd.DataFrame(shap_low, columns=feats_selected)
+print(f"SHAP matrix shape: {shap_df.shape}")
+
+# ======================================================================
+# 5. CONTRAST
+# ======================================================================
+def mean_abs(df_, mask): return df_.loc[mask].abs().mean()
+
+contrast = pd.DataFrame({
+    "mean_abs_TP":      mean_abs(shap_df, mask_tp),
+    "mean_abs_FN_all":  mean_abs(shap_df, mask_fn_all),
+    "mean_abs_FN_high": mean_abs(shap_df, mask_fn_high),
+    "mean_abs_FN_med":  mean_abs(shap_df, mask_fn_med),
+})
+contrast["delta_TP_vs_FN_all"]  = contrast["mean_abs_TP"] - contrast["mean_abs_FN_all"]
+contrast["delta_TP_vs_FN_high"] = contrast["mean_abs_TP"] - contrast["mean_abs_FN_high"]
+
+contrast_sorted = contrast.reindex(
+    contrast["delta_TP_vs_FN_all"].abs().sort_values(ascending=False).index
+)
+
+print("\n=== Top 20 features by |TP - FN_all| gap ===")
+print(contrast_sorted.head(20).round(4).to_string())
+
+contrast_sorted.to_csv(os.path.join(OUT_DIR, "subrq4_shap_contrast.csv"))
+print(f"\nSaved: {OUT_DIR}\\subrq4_shap_contrast.csv")
+
+# ======================================================================
+# 6. FIGURE
+# ======================================================================
+top15 = contrast_sorted.head(15).iloc[::-1]
+y_pos = np.arange(len(top15))
+
+fig, ax = plt.subplots(figsize=(9, 6.5))
+ax.barh(y_pos - 0.2, top15["mean_abs_TP"], 0.4,
+        color="#2c7fb8", label=f"Correctly classified (n={mask_tp.sum()})")
+ax.barh(y_pos + 0.2, top15["mean_abs_FN_all"], 0.4,
+        color="#c0392b", label=f"False negatives (n={mask_fn_all.sum()})")
+
+ax.set_yticks(y_pos)
+ax.set_yticklabels(top15.index, fontsize=9)
+ax.set_xlabel("Mean |SHAP value| (low-credibility class output)")
+ax.set_title("Structural signals separating detected from missed\n"
+             "low-credibility sources (top 15 by gap)")
+ax.legend(loc="lower right", frameon=False)
+ax.spines["top"].set_visible(False)
+ax.spines["right"].set_visible(False)
+ax.xaxis.grid(True, linestyle="--", linewidth=0.4, alpha=0.6)
+ax.set_axisbelow(True)
+plt.tight_layout()
+
+plt.savefig(os.path.join(OUT_DIR, "subrq4_shap_contrast.png"), dpi=300, bbox_inches="tight")
+plt.savefig(os.path.join(OUT_DIR, "subrq4_shap_contrast.pdf"), bbox_inches="tight")
+print(f"Saved: {OUT_DIR}\\subrq4_shap_contrast.png")
+plt.show()
