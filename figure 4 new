@@ -1,0 +1,70 @@
+"""
+Figure 4: Low-credibility F1 across all model configurations.
+Baseline vs. enriched dataset. No reference line.
+"""
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+# --- Data (low-credibility F1 from Table 1) -----------------------------
+# Order matches the original Figure 4 layout.
+configs = [
+    "RF_SMOTE",
+    "RF_SMOTE_weights",
+    "RF_class_weights",
+    "RF_no_balance",
+    "Stacking_RF_XGB",
+    "XGB_SMOTE",
+    "XGB_SMOTE_weights",
+    "XGB_class_weights",
+    "XGB_no_balance",
+]
+
+baseline = [0.222, 0.364, 0.222, 0.000, 0.267, 0.000, 0.222, 0.400, 0.000]
+enriched = [0.416, 0.416, 0.325, 0.315, 0.446, 0.453, 0.458, 0.437, 0.425]
+
+# --- Plot ---------------------------------------------------------------
+x = np.arange(len(configs))
+width = 0.38
+
+fig, ax = plt.subplots(figsize=(11, 5.5))
+
+bars_base = ax.bar(x - width / 2, baseline, width,
+                   label="Baseline", color="#c0392b", edgecolor="black",
+                   linewidth=0.4)
+bars_enr  = ax.bar(x + width / 2, enriched, width,
+                   label="Enriched", color="#9e9e9e", edgecolor="black",
+                   linewidth=0.4)
+
+# Value labels above each bar
+for bars in (bars_base, bars_enr):
+    for bar in bars:
+        height = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width() / 2,
+                height + 0.012,
+                f"{height:.3f}",
+                ha="center", va="bottom", fontsize=8)
+
+# --- Cosmetics ----------------------------------------------------------
+ax.set_ylabel("Low-credibility F1 score")
+ax.set_title("Low-Credibility Class Performance (Primary Metric)",
+             fontsize=11)
+ax.set_xticks(x)
+ax.set_xticklabels(configs, rotation=30, ha="right")
+ax.set_ylim(0, 0.65)
+ax.set_axisbelow(True)
+ax.yaxis.grid(True, linestyle="--", linewidth=0.4, alpha=0.6)
+ax.spines["top"].set_visible(False)
+ax.spines["right"].set_visible(False)
+
+ax.legend(title="Dataset", loc="upper left", frameon=False)
+
+plt.tight_layout()
+
+# --- Save ---------------------------------------------------------------
+plt.savefig("figure4_low_credibility_f1.png", dpi=300, bbox_inches="tight")
+plt.savefig("figure4_low_credibility_f1.pdf", bbox_inches="tight")
+plt.show()
+
+print("Saved: figure4_low_credibility_f1.png  (300 dpi)")
+print("Saved: figure4_low_credibility_f1.pdf")
