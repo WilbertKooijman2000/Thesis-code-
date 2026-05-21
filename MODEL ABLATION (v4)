@@ -1,0 +1,360 @@
+"""
+============================================================================
+MODEL ABLATION (v4) — Feature-tier comparison for structural credibility
+============================================================================
+Master Thesis - Wilbert | Tilburg University
+Supervisor: Dr. Chris Emmery
+
+Responds to Emmery's feedback on the role of human-labelled features.
+Re-runs the v4 enriched pipeline on three feature tiers, holding every
+other setting constant (data, 5-fold stratified CV, SMOTE/class-weights,
+Optuna budget, hyperparameter search space, random_state=42):
+
+  Tier 0 (Full)            replicates the v4 enriched experiment
+                           -> the macro-F1 here should match the
+                              published 0.594 within rounding
+
+  Tier 1 (NoMBFC)          drops human-coded MBFC metadata
+                           (media_type_*, country_*, traffic_*)
+                           -> direct response to Emmery's question:
+                              does predictive power survive without
+                              the human labels?
+
+  Tier 2 (PureStructural)  also drops text-derived features
+                           (ngram_*, clickbait_*, has_*_link,
+                            ad_keyword_count / ad_density,
+                            social_media_link_count, word/text stats)
+                           -> stricter test: "just HTML and CSS"
+
+What stays in Tier 2 (i.e. still treated as structural):
+  - tag counts: num_divs, num_iframes, num_paragraphs, num_headings, ...
+  - DOM shape: max_dom_depth, html_length, total_tags, unique_tags
+  - CSS metrics: everything css_* and ext_css_*
+  - meta-tag presence flags: has_meta_description, has_og_tags,
+    has_canonical, has_robots_meta, has_twitter_tags, meta_tag_count
+  - attribute-based detectors that read markup, not body text:
+    ad_iframe_count (counts iframes by src), popup_indicator_count
+    (counts elements by class/id), hidden_element_count, num_inline_styles,
+    third_party_script_domains, inline_script_count, external_script_count
+  - link counts: num_links_total/internal/external/nofollow/empty,
+    external_link_ratio, internal_link_ratio
+
+This script imports model_comparison_v4 as a library. Put it in the same
+directory as model_comparison_v4.py.
+
+Side effect: importing v4 calls logging.basicConfig at module level, which
+opens model_comparison.log in write mode and truncates it. This script
+makes a .pre_ablation_backup copy of that log first, so the previous v4
+log is not lost.
+
+Usage:
+    python model_ablation_v4.py
+
+Outputs (in thesis_output/model_results_v4_ablation/):
+    results_ablation_<timestamp>.csv    one row per (tier, model)
+    results_ablation_latest.csv         same, stable filename
+    ablation_summary.csv                headline rows for the writeup
+    ablation_tier_comparison.png        bar chart, macro & low-cred F1
+    features_<tier>.csv                 exact feature list per tier
+    cm_Ablation_<tier>__*.png           confusion matrices
+    predictions/                        per-instance preds per (tier, model)
+    ablation.log                        full log
+    data_cache.pkl                      cached enriched_df (reused on rerun)
+============================================================================
+"""
+
+import os
+import sys
+import re
+import pickle
+import shutil
+import logging
+import warnings
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+warnings.filterwarnings("ignore")
+
+
+# ----------------------------------------------------------------------------
+# Locate v4 module
+# ----------------------------------------------------------------------------
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+
+
+# ----------------------------------------------------------------------------
+# Back up v4 log before import (v4 truncates it via logging.basicConfig)
+# ----------------------------------------------------------------------------
+V4_LOG = os.path.join(
+    r"C:\Users\Wilbe\OneDrive\Desktop\profiling-data-Copy(1)",
+    "thesis_output", "model_results_v4", "model_comparison.log",
+)
+if os.path.exists(V4_LOG):
+    backup = V4_LOG + ".pre_ablation_backup"
+    try:
+        shutil.copy2(V4_LOG, backup)
+        print(f"[ablation] Backed up existing v4 log -> {backup}")
+    except Exception as e:
+        print(f"[ablation] WARN: could not back up v4 log: {e}")
+
+
+import model_comparison_v4 as v4  # noqa: E402
+
+
+# ----------------------------------------------------------------------------
+# Redirect v4 outputs to a separate folder so nothing from v4 is overwritten
+# ----------------------------------------------------------------------------
+ABLATION_DIR = os.path.join(
+    os.path.dirname(v4.CONFIG["output_dir"]),
+    "model_results_v4_ablation",
+)
+os.makedirs(ABLATION_DIR, exist_ok=True)
+v4.CONFIG["output_dir"] = ABLATION_DIR
+v4.PREDS_DIR = os.path.join(ABLATION_DIR, "predictions")
+os.makedirs(v4.PREDS_DIR, exist_ok=True)
+
+# Reconfigure root logging to write into the ablation folder.
+log_path = os.path.join(ABLATION_DIR, "ablation.log")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(log_path, mode="w", encoding="utf-8"),
+    ],
+    force=True,
+)
+logger = v4.logger
+
+
+# ============================================================================
+# Tier definitions — regex patterns on raw (pre-engineering) feature names
+# ============================================================================
+MBFC_PATTERNS = (
+    re.compile(r"^media_type_"),
+    re.compile(r"^country_"),
+    re.compile(r"^traffic_"),
+)
+
+CONTENT_PATTERNS = (
+    re.compile(r"^ngram_"),
+    re.compile(r"^clickbait_"),
+    re.compile(r"^has_(about_page|contact_page|privacy_policy|terms)_link$"),
+    re.compile(r"^(ad_keyword_count|ad_density|social_media_link_count)$"),
+    re.compile(
+        r"^(text_to_html_ratio|word_count|avg_word_length|"
+        r"sentence_count|avg_sentence_length|text_length)$"
+    ),
+)
+
+TIERS = {
+    "Full":           (),
+    "NoMBFC":         MBFC_PATTERNS,
+    "PureStructural": MBFC_PATTERNS + CONTENT_PATTERNS,
+}
+
+
+def filter_features(feature_cols, patterns):
+    """Partition feature_cols into (kept, dropped) by exclusion patterns."""
+    if not patterns:
+        return list(feature_cols), []
+    kept, dropped = [], []
+    for f in feature_cols:
+        if any(p.search(f) for p in patterns):
+            dropped.append(f)
+        else:
+            kept.append(f)
+    return kept, dropped
+
+
+# ============================================================================
+# Data caching — avoid rebuilding HTML/CSS features per tier
+# ============================================================================
+CACHE_PATH = os.path.join(ABLATION_DIR, "data_cache.pkl")
+
+
+def load_or_build_data():
+    if os.path.exists(CACHE_PATH):
+        logger.info(f"Loading cached data from {CACHE_PATH}")
+        with open(CACHE_PATH, "rb") as f:
+            cache = pickle.load(f)
+        return cache["enriched_df"], cache["shared_features"]
+
+    logger.info("No cache found — building datasets from scratch (this takes a while)")
+    entries, mbfc_lookup = v4.load_mbfc_metadata(v4.CONFIG["mbfc_json_path"])
+    css_lookup = v4.load_external_css_features(v4.CONFIG["css_front_dir"])
+    baseline_df = v4.build_baseline_dataset(
+        v4.CONFIG["html_front_dir"], mbfc_lookup, css_lookup
+    )
+    if baseline_df.empty:
+        raise RuntimeError("Baseline dataset is empty — check paths in v4 CONFIG")
+
+    feature_cols_baseline = v4.get_feature_columns(baseline_df)
+    enriched_df = v4.build_enriched_dataset(
+        baseline_df, v4.CONFIG["enriched_csv"], entries
+    )
+    feature_cols_enriched = v4.get_feature_columns(enriched_df)
+    shared_features = sorted(set(feature_cols_baseline) & set(feature_cols_enriched))
+
+    with open(CACHE_PATH, "wb") as f:
+        pickle.dump(
+            {"enriched_df": enriched_df, "shared_features": shared_features}, f
+        )
+    logger.info(
+        f"Cached enriched data ({len(enriched_df)} rows, "
+        f"{len(shared_features)} shared features) -> {CACHE_PATH}"
+    )
+    return enriched_df, shared_features
+
+
+# ============================================================================
+# Plot
+# ============================================================================
+def plot_tier_comparison(summary_df, output_dir):
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    x = np.arange(len(summary_df))
+
+    axes[0].bar(x, summary_df["macro_f1"],
+                color=["#5b8c5a", "#7195a8", "#a47ec1"])
+    axes[0].set_xticks(x)
+    axes[0].set_xticklabels(summary_df["tier"])
+    axes[0].set_ylabel("Macro F1 (5-fold CV)")
+    axes[0].set_title("Macro F1 across feature tiers\n(XGB SMOTE + class weights, enriched)")
+    for i, v in enumerate(summary_df["macro_f1"]):
+        axes[0].text(i, v + 0.005, f"{v:.3f}", ha="center", fontsize=10)
+    axes[0].set_ylim(0, max(summary_df["macro_f1"].max() * 1.15, 0.7))
+
+    axes[1].bar(x, summary_df["f1_low"],
+                color=["#c66b48", "#d4895e", "#e0a574"])
+    axes[1].set_xticks(x)
+    axes[1].set_xticklabels(summary_df["tier"])
+    axes[1].set_ylabel("Low-credibility F1")
+    axes[1].set_title("Low-credibility F1 across feature tiers")
+    for i, v in enumerate(summary_df["f1_low"]):
+        axes[1].text(i, v + 0.005, f"{v:.3f}", ha="center", fontsize=10)
+    axes[1].set_ylim(0, max(summary_df["f1_low"].max() * 1.15, 0.6))
+
+    plt.tight_layout()
+    out = os.path.join(output_dir, "ablation_tier_comparison.png")
+    plt.savefig(out, dpi=150)
+    plt.close()
+    logger.info(f"Saved tier-comparison figure -> {out}")
+
+
+# ============================================================================
+# Main
+# ============================================================================
+def main():
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    logger.info(f"\nAblation pipeline started at {timestamp}")
+    logger.info(f"Output directory: {ABLATION_DIR}\n")
+
+    enriched_df, shared_features = load_or_build_data()
+    logger.info(f"Full shared feature pool: {len(shared_features)} features")
+
+    all_results = []
+    tier_summary = []
+
+    for tier_name, patterns in TIERS.items():
+        kept, dropped = filter_features(shared_features, patterns)
+
+        logger.info(f"\n{'=' * 80}")
+        logger.info(f"TIER: {tier_name}")
+        logger.info(f"{'=' * 80}")
+        logger.info(
+            f"Kept {len(kept)} / {len(shared_features)} features "
+            f"({len(dropped)} dropped)"
+        )
+        if dropped:
+            logger.info("Dropped features:")
+            for d in sorted(dropped):
+                logger.info(f"   - {d}")
+
+        # Persist exact feature list per tier
+        pd.DataFrame({"feature": kept}).to_csv(
+            os.path.join(ABLATION_DIR, f"features_{tier_name}.csv"),
+            index=False,
+        )
+
+        # Also drop the columns from the DataFrame so engineer_features()
+        # inside run_experiment cannot reconstruct content via derived
+        # features (e.g. log_word_count, ratio_ads_per_paragraph,
+        # clickbait_total, deception_score, interact_ads_x_hidden).
+        df_tier = enriched_df.drop(columns=dropped, errors="ignore").copy()
+
+        tier_results = v4.run_experiment(
+            df_tier,
+            f"Ablation_{tier_name}",
+            kept,
+            n_folds=v4.CONFIG["n_folds"],
+            random_state=v4.CONFIG["random_state"],
+            save_final_xgb_model=False,
+        )
+
+        for r in tier_results:
+            r["tier"] = tier_name
+            r["n_features_input"] = len(kept)
+        all_results.extend(tier_results)
+
+        # Headline row per tier: XGB_SMOTE_weights (the published best)
+        for r in tier_results:
+            if r["model"] == "XGB_SMOTE_weights":
+                tier_summary.append({
+                    "tier": tier_name,
+                    "n_features_input": len(kept),
+                    "macro_f1": round(r["macro_f1_mean"], 4),
+                    "macro_f1_std": round(r["macro_f1_std"], 4),
+                    "f1_high": round(r.get("f1_high", float("nan")), 4),
+                    "f1_medium": round(r.get("f1_medium", float("nan")), 4),
+                    "f1_low": round(r.get("f1_low", float("nan")), 4),
+                    "accuracy": round(r["accuracy"], 4),
+                })
+
+    # ---- Save everything ----
+    results_df = pd.DataFrame(all_results)
+    results_df.to_csv(
+        os.path.join(ABLATION_DIR, f"results_ablation_{timestamp}.csv"),
+        index=False,
+    )
+    results_df.to_csv(
+        os.path.join(ABLATION_DIR, "results_ablation_latest.csv"),
+        index=False,
+    )
+
+    summary_df = pd.DataFrame(tier_summary)
+    summary_df.to_csv(
+        os.path.join(ABLATION_DIR, "ablation_summary.csv"),
+        index=False,
+    )
+
+    if not summary_df.empty:
+        plot_tier_comparison(summary_df, ABLATION_DIR)
+
+    logger.info(f"\n{'=' * 80}")
+    logger.info("ABLATION SUMMARY (XGB SMOTE + class weights, enriched dataset)")
+    logger.info(f"{'=' * 80}")
+    logger.info(f"\n{summary_df.to_string(index=False)}\n")
+
+    logger.info(
+        "Reproducibility check: the 'Full' tier replays the enriched "
+        "XGB_SMOTE_weights configuration from model_comparison_v4.py and "
+        "should match its reported macro F1 (around 0.594) within "
+        "rounding. If it doesn't, something in the pipeline has drifted."
+    )
+    logger.info(f"\nAll results saved to: {ABLATION_DIR}\n")
+
+
+if __name__ == "__main__":
+    print("""
+    +---------------------------------------------------------------+
+    |  MODEL ABLATION  v4                                           |
+    |  Feature-tier comparison for structural credibility           |
+    |  Responds to feedback from Dr. Chris Emmery                   |
+    +---------------------------------------------------------------+
+    """)
+    main()
